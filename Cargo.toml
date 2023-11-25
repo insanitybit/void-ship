@@ -1,0 +1,13 @@
+[package]
+name = "void-ship"
+version = "0.1.0"
+edition = "2021"
+
+
+[dependencies]
+libc = "0.2.150"
+thiserror = "1.0.50"
+
+[features]
+default = []
+test-clock = []
