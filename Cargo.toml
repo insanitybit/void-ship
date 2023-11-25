@@ -1,13 +1,13 @@
 [package]
 name = "void-ship"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "A crate to remove access to vDSO and vvar"
 repository = "https://github.com/insanitybit/void-ship"
 documentation = "https://docs.rs/void-ship"
 readme = "README.md"
 keywords = ["security", "time", "side-channel", "linux", "vDSO"]
-categories = ["operating-systems", "security-tools"]
+categories = []
 license = "MIT"
 
 [dependencies]
