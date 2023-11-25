@@ -2,7 +2,8 @@
 name = "void-ship"
 version = "0.1.0"
 edition = "2021"
-
+description = "A crate to remove access to vDSO and vvar"
+license = "MIT"
 
 [dependencies]
 libc = "0.2.150"
