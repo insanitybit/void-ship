@@ -12,7 +12,6 @@ license = "MIT"
 
 [dependencies]
 libc = "0.2.150"
-thiserror = "1.0.50"
 
 [features]
 default = []

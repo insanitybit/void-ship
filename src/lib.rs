@@ -1,17 +1,46 @@
-use libc::*;
-use libc::{mmap, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, PROT_NONE};
-use std::fs;
+use std::fmt::Formatter;
 use std::io::Error as IoError;
 
-#[derive(thiserror::Error, Debug)]
-pub enum Error {
-    #[error("io error")]
-    IoError(#[from] IoError),
-    #[error("Invalid format: expected two parts separated by '-'. Line: {0}")]
-    InvalidFormat(String),
+use libc::*;
+use libc::{mmap, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, PROT_NONE};
 
-    #[error("Failed to parse address: {0}")]
-    ParseIntError(#[from] std::num::ParseIntError),
+#[derive(Debug)]
+pub enum Error {
+    IoError(IoError),
+    InvalidFormat(&'static str),
+    ParseIntError(std::num::ParseIntError),
+}
+
+impl From<IoError> for Error {
+    fn from(e: IoError) -> Self {
+        Error::IoError(e)
+    }
+}
+
+impl From<std::num::ParseIntError> for Error {
+    fn from(e: std::num::ParseIntError) -> Self {
+        Error::ParseIntError(e)
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::IoError(e) => Some(e),
+            Error::InvalidFormat(_) => None,
+            Error::ParseIntError(e) => Some(e),
+        }
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::IoError(e) => write!(f, "IoError: {}", e),
+            Error::InvalidFormat(s) => write!(f, "InvalidFormat: {}", s),
+            Error::ParseIntError(e) => write!(f, "ParseIntError: {}", e),
+        }
+    }
 }
 
 // Function to unmap a memory region
@@ -52,19 +81,42 @@ pub fn test_clock() -> ! {
 }
 
 // This is used internally, exclusively, so I don't feel the need to refactor the return type
-#[allow(clippy::type_complexity)]
 #[cfg(target_os = "linux")]
-fn find_mapping_addresses(
-) -> Result<(Option<(*mut c_void, size_t)>, Option<(*mut c_void, size_t)>), Error> {
-    let maps = fs::read_to_string("/proc/self/maps")?;
+#[allow(clippy::type_complexity)]
+fn find_mapping_addresses() -> Result<
+    (
+        Option<(*mut libc::c_void, libc::size_t)>,
+        Option<(*mut libc::c_void, libc::size_t)>,
+    ),
+    Error,
+> {
+    use std::fs::File;
+    use std::io::{self, Read};
+
+    let file = File::open("/proc/self/maps")?;
+    let mut file = io::BufReader::new(file);
+    let mut buffer = [0u8; 1024]; // Stack-allocated buffer
+    let mut line = Vec::new(); // Collects a line
+
     let mut vdso_address = None;
     let mut vvar_address = None;
 
-    for line in maps.lines() {
-        if line.contains("[vdso]") {
-            vdso_address = Some(parse_address_and_size(line)?);
-        } else if line.contains("[vvar]") {
-            vvar_address = Some(parse_address_and_size(line)?);
+    while let Ok(bytes_read) = file.read(&mut buffer) {
+        if bytes_read == 0 {
+            break;
+        }
+
+        for &byte in &buffer[..bytes_read] {
+            if byte == b'\n' {
+                if line.windows(6).any(|window| window == b"[vdso]") {
+                    vdso_address = Some(parse_address_and_size(&line)?);
+                } else if line.windows(6).any(|window| window == b"[vvar]") {
+                    vvar_address = Some(parse_address_and_size(&line)?);
+                }
+                line.clear();
+            } else {
+                line.push(byte);
+            }
         }
     }
 
@@ -72,27 +124,39 @@ fn find_mapping_addresses(
 }
 
 #[cfg(target_os = "linux")]
-fn parse_address_and_size(line: &str) -> Result<(*mut c_void, size_t), Error> {
-    // Safely attempt to split the line and collect parts
-    let parts: Vec<&str> = line
-        .split_whitespace()
+fn parse_address_and_size(line: &[u8]) -> Result<(*mut libc::c_void, libc::size_t), Error> {
+    let mut parts = line
+        .splitn(2, |&b| b == b' ')
         .next()
-        .ok_or_else(|| Error::InvalidFormat(line.to_string()))?
-        .split('-')
-        .collect();
+        .ok_or(Error::InvalidFormat("Invalid /proc/self/maps"))?
+        .splitn(2, |&b| b == b'-');
 
-    // Ensure there are exactly two parts
-    if parts.len() != 2 {
-        return Err(Error::InvalidFormat(line.to_string()));
-    }
+    let start_str = parts
+        .next()
+        .ok_or(Error::InvalidFormat("Invalid /proc/self/maps"))?;
+    let end_str = parts
+        .next()
+        .ok_or(Error::InvalidFormat("Invalid /proc/self/maps"))?;
 
-    // Parse the addresses
-    let start_address = usize::from_str_radix(parts[0], 16)?;
-    let end_address = usize::from_str_radix(parts[1], 16)?;
+    let start_address = parse_hex(start_str)?;
+    let end_address = parse_hex(end_str)?;
 
-    // Calculate size and convert start_address to a pointer
     let size = end_address - start_address;
-    Ok((start_address as *mut c_void, size))
+    Ok((start_address as *mut libc::c_void, size))
+}
+
+fn parse_hex(hex_slice: &[u8]) -> Result<usize, Error> {
+    let mut num = 0;
+    for &byte in hex_slice {
+        num = num * 16
+            + match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => 10 + byte - b'a',
+                b'A'..=b'F' => 10 + byte - b'A',
+                _ => return Err(Error::InvalidFormat("Invalid hexadecimal number")),
+            } as usize;
+    }
+    Ok(num)
 }
 
 #[cfg(target_os = "linux")]
@@ -120,11 +184,9 @@ fn allocate_guard_page(address: *mut c_void, size: size_t) -> Result<(), Error> 
 pub fn remove_timer_mappings() -> Result<(), Error> {
     let (Some((vdso_address, vdso_size)), Some((vvar_address, vvar_size))) =
         find_mapping_addresses()?
-        else {
-            return Err(Error::InvalidFormat(
-                "Could not find vdso or vvar mappings".to_string(),
-            ));
-        };
+    else {
+        return Err(Error::InvalidFormat("Could not find vdso or vvar mappings"));
+    };
     // Assuming the regions are at least one page in size
     unsafe {
         unmap_region(vdso_address, vdso_size)?;
@@ -139,9 +201,7 @@ pub fn replace_timer_mappings() -> Result<(), Error> {
     let (Some((vdso_address, vdso_size)), Some((vvar_address, vvar_size))) =
         find_mapping_addresses()?
     else {
-        return Err(Error::InvalidFormat(
-            "Could not find vdso or vvar mappings".to_string(),
-        ));
+        return Err(Error::InvalidFormat("Could not find vdso or vvar mappings"));
     };
     // Assuming the regions are at least one page in size
     unsafe {
