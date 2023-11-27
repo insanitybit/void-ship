@@ -1,6 +1,6 @@
 [package]
 name = "void-ship"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "A crate to remove access to vDSO and vvar"
 repository = "https://github.com/insanitybit/void-ship"
