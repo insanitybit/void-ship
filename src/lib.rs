@@ -1,42 +1,38 @@
-use std::fmt::Formatter;
-use std::io::Error as IoError;
+use core::ffi::CStr;
+use core::fmt::Formatter;
 
+#[cfg(target_os = "linux")]
 use libc::*;
-use libc::{mmap, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, PROT_NONE};
 
 #[derive(Debug)]
 pub enum Error {
-    IoError(IoError),
+    IoError(&'static str, c_int),
     InvalidFormat(&'static str),
-    ParseIntError(std::num::ParseIntError),
+    ParseIntError(core::num::ParseIntError),
 }
 
-impl From<IoError> for Error {
-    fn from(e: IoError) -> Self {
-        Error::IoError(e)
-    }
-}
-
-impl From<std::num::ParseIntError> for Error {
-    fn from(e: std::num::ParseIntError) -> Self {
+impl From<core::num::ParseIntError> for Error {
+    fn from(e: core::num::ParseIntError) -> Self {
         Error::ParseIntError(e)
     }
 }
 
+// When `error_in_core` lands this can be made `core::error::Error`
+//  see issue #103765 https://github.com/rust-lang/rust/issues/103765
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::IoError(e) => Some(e),
+            Error::IoError(_, _) => None,
             Error::InvalidFormat(_) => None,
             Error::ParseIntError(e) => Some(e),
         }
     }
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         match self {
-            Error::IoError(e) => write!(f, "IoError: {}", e),
+            Error::IoError(s, e) => write!(f, "IoError: {} {}", s, e),
             Error::InvalidFormat(s) => write!(f, "InvalidFormat: {}", s),
             Error::ParseIntError(e) => write!(f, "ParseIntError: {}", e),
         }
@@ -45,11 +41,12 @@ impl std::fmt::Display for Error {
 
 // Function to unmap a memory region
 #[cfg(target_os = "linux")]
-unsafe fn unmap_region(address: *mut c_void, size: size_t) -> Result<(), IoError> {
-    if munmap(address, size) == 0 {
+unsafe fn unmap_region(address: *mut c_void, size: size_t) -> Result<(), Error> {
+    let errno = munmap(address, size);
+    if errno == 0 {
         Ok(())
     } else {
-        Err(IoError::last_os_error())
+        Err(Error::IoError("munmap", errno))
     }
 }
 
@@ -81,8 +78,11 @@ pub fn test_clock() -> ! {
 }
 
 // This is used internally, exclusively, so I don't feel the need to refactor the return type
+// let path = unsafe {
+// // SAFETY: This is a valid, static C string
+// CStr::from_bytes_until_nul(b"/proc/self/maps\x00").unwrap_unchecked()
+// };
 #[cfg(target_os = "linux")]
-#[allow(clippy::type_complexity)]
 fn find_mapping_addresses() -> Result<
     (
         Option<(*mut libc::c_void, libc::size_t)>,
@@ -90,64 +90,66 @@ fn find_mapping_addresses() -> Result<
     ),
     Error,
 > {
-    use std::fs::File;
-    use std::io::{self, Read};
+    let path = unsafe {
+        // SAFETY: This is a valid, static C string
+        CStr::from_bytes_until_nul(b"/proc/self/maps\x00").unwrap_unchecked()
+    };
+    let fd = unsafe { open(path.as_ptr(), O_RDONLY) };
+    if fd < 0 {
+        return Err(Error::IoError("open", fd));
+    }
 
-    let file = File::open("/proc/self/maps")?;
-    let mut file = io::BufReader::new(file);
-    let mut buffer = [0u8; 1024]; // Stack-allocated buffer
-    let mut line = Vec::new(); // Collects a line
+    // One page size seems appropriate, especially since even a small /proc/self/maps
+    // is typically > 2048 bytes
+    let mut buffer = [0u8; 4096];
+    // `line` should be at least 80 bytes, in order to hold the full `vdso` or `vvar` lines,
+    // but we can make it larger in case there's every something odd about it
+    let mut line = [0u8; 1024];
+    let mut line_idx = 0;
+    let mut vvar = None;
+    let mut vdso = None;
 
-    let mut vdso_address = None;
-    let mut vvar_address = None;
-
-    while let Ok(bytes_read) = file.read(&mut buffer) {
-        if bytes_read == 0 {
-            break;
+    loop {
+        let bytes_read =
+            unsafe { read(fd, buffer.as_mut_ptr() as *mut libc::c_void, buffer.len()) };
+        if bytes_read <= 0 {
+            break; // EOF or error
         }
 
-        for &byte in &buffer[..bytes_read] {
+        for &byte in &buffer[..bytes_read as usize] {
             if byte == b'\n' {
                 if line.windows(6).any(|window| window == b"[vdso]") {
-                    vdso_address = Some(parse_address_and_size(&line)?);
+                    vdso = Some(parse_addresses(&line[..12], &line[13..25])?);
                 } else if line.windows(6).any(|window| window == b"[vvar]") {
-                    vvar_address = Some(parse_address_and_size(&line)?);
+                    vvar = Some(parse_addresses(&line[..12], &line[13..25])?);
                 }
-                line.clear();
+                line_idx = 0; // Reset for the next line
             } else {
-                line.push(byte);
+                if line_idx < line.len() {
+                    line[line_idx] = byte;
+                    line_idx += 1;
+                }
             }
         }
     }
 
-    Ok((vdso_address, vvar_address))
+    unsafe { close(fd) };
+    Ok((vvar, vdso))
 }
 
-#[cfg(target_os = "linux")]
-fn parse_address_and_size(line: &[u8]) -> Result<(*mut libc::c_void, libc::size_t), Error> {
-    let mut parts = line
-        .splitn(2, |&b| b == b' ')
-        .next()
-        .ok_or(Error::InvalidFormat("Invalid /proc/self/maps"))?
-        .splitn(2, |&b| b == b'-');
+fn parse_addresses(
+    start_addr: &[u8],
+    end_addr: &[u8],
+) -> Result<(*mut libc::c_void, libc::size_t), Error> {
+    let start = parse_hex_address(start_addr)?;
+    let end = parse_hex_address(end_addr)?;
 
-    let start_str = parts
-        .next()
-        .ok_or(Error::InvalidFormat("Invalid /proc/self/maps"))?;
-    let end_str = parts
-        .next()
-        .ok_or(Error::InvalidFormat("Invalid /proc/self/maps"))?;
-
-    let start_address = parse_hex(start_str)?;
-    let end_address = parse_hex(end_str)?;
-
-    let size = end_address - start_address;
-    Ok((start_address as *mut libc::c_void, size))
+    Ok((start as *mut libc::c_void, end - start))
 }
 
-fn parse_hex(hex_slice: &[u8]) -> Result<usize, Error> {
+fn parse_hex_address(addr: &[u8]) -> Result<usize, Error> {
     let mut num = 0;
-    for &byte in hex_slice {
+    for &byte in addr {
         num = num * 16
             + match byte {
                 b'0'..=b'9' => byte - b'0',
@@ -173,7 +175,7 @@ fn allocate_guard_page(address: *mut c_void, size: size_t) -> Result<(), Error> 
     };
 
     if result == libc::MAP_FAILED {
-        Err(IoError::last_os_error().into())
+        Err(Error::IoError("mmap", result as c_int))
     } else {
         Ok(())
     }
