@@ -36,6 +36,7 @@ fn main() {
     unsafe { libc::prctl(libc::PR_SET_TSC, libc::PR_TSC_SIGSEGV, 0, 0, 0) }.unwrap();
     unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) }.unwrap();
 }
+```
 ## Usage
 
 `void-ship` provides two primary functions:
