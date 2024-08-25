@@ -28,6 +28,14 @@ This library is intended to be used in a very specific context - a process that 
 filter
 applied to it that does virtually nothing but execute pure functions.
 
+### Important Note
+To further reduce access to a clock you should block access to `PR_SET_TSC` as it can be used to forge an accurate clock. In the future this may be added to the library in a minor version change.
+```
+extern crate libc;
+fn main() {
+    unsafe { libc::prctl(libc::PR_SET_TSC, libc::PR_TSC_SIGSEGV, 0, 0, 0) }.unwrap();
+    unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) }.unwrap();
+}
 ## Usage
 
 `void-ship` provides two primary functions:
